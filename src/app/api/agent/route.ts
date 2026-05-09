@@ -4,7 +4,7 @@ import { runAgentWorkflow } from "@/lib/agent/workflow";
 
 export const runtime = "nodejs";
 /** Serverless ceiling; align with `AGENT_WORKFLOW_TIMEOUT_MS` on your host. */
-export const maxDuration = 900;
+export const maxDuration = 300;
 
 const RequestSchema = z.object({
   message: z.string().min(1),
