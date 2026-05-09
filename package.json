@@ -1,0 +1,58 @@
+{
+  "name": "paperpilot-ai",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=20.19.0 || >=22.13.0"
+  },
+  "scripts": {
+    "dev": "env -u CI NEXT_IGNORE_INCORRECT_LOCKFILE=1 NEXT_TEST_WASM=1 node node_modules/next/dist/bin/next dev",
+    "dev:docker": "docker compose up",
+    "build": "env -u CI NEXT_IGNORE_INCORRECT_LOCKFILE=1 NEXT_TEST_WASM=1 node node_modules/next/dist/bin/next build",
+    "start": "env -u CI NEXT_IGNORE_INCORRECT_LOCKFILE=1 NEXT_TEST_WASM=1 node node_modules/next/dist/bin/next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@base-ui/react": "^1.4.1",
+    "@langchain/community": "^1.1.28",
+    "@langchain/core": "^1.1.44",
+    "@langchain/openai": "^1.4.5",
+    "@next/swc-wasm-nodejs": "15.5.15",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "duck-duck-scrape": "^2.2.7",
+    "jspdf": "^4.2.1",
+    "langchain": "^1.3.5",
+    "lucide-react": "^1.14.0",
+    "next": "^15.5.15",
+    "next-themes": "^0.4.6",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "shadcn": "^4.7.0",
+    "sonner": "^2.0.7",
+    "tailwind-merge": "^3.5.0",
+    "tw-animate-css": "^1.4.0",
+    "zod": "^3.25.76"
+  },
+  "optionalDependencies": {
+    "@next/swc-linux-x64-gnu": "15.5.15",
+    "@next/swc-linux-x64-musl": "15.5.15"
+  },
+  "overrides": {
+    "lightningcss": "1.32.0"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3.3.5",
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "eslint": "^9",
+    "eslint-config-next": "^15.5.15",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  },
+  "description": "PaperPilot AI — steps, checklists, and drafts for Pakistan processes."
+}
