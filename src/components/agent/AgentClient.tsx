@@ -6,6 +6,13 @@ import { CheckCircle2, Clock3, Loader2, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { AgentResponseSchema } from "@/lib/agent/schemas";
+import {
+  parseSSE,
+  type StreamPhase,
+  type ExtractPayload,
+  type ResearchPayload,
+  type GeneratePayload,
+} from "@/lib/agent/stream-events";
 import { buildDraftPdf } from "@/lib/build-draft-pdf";
 import { AgentMarkdown } from "@/components/agent/AgentMarkdown";
 import { Badge } from "@/components/ui/badge";
@@ -33,11 +40,15 @@ import { Separator } from "@/components/ui/separator";
 
 type Screen = 1 | 2 | 3;
 
-const WORKFLOW_PHASES = [
+const WORKFLOW_PHASES: {
+  key: StreamPhase;
+  title: string;
+  detail: string;
+}[] = [
   {
     key: "extract",
     title: "Understanding your request",
-    detail: "Working out what you’re applying for and what to ask next.",
+    detail: "Working out what you're applying for and what to ask next.",
   },
   {
     key: "research",
@@ -45,33 +56,40 @@ const WORKFLOW_PHASES = [
     detail: "Searching for Pakistan portals, forms, and practical guidance.",
   },
   {
-    key: "validate",
-    title: "Checking what’s missing",
-    detail: "Spotting gaps in your details and anything risky to flag.",
-  },
-  {
     key: "generate",
     title: "Building your guide & drafts",
     detail: "Writing steps, document checklist, and copy-ready draft text.",
   },
-] as const;
+  {
+    key: "translate",
+    title: "Translating to Urdu",
+    detail: "Preparing an Urdu version of the guidance.",
+  },
+];
 
-const LIVE_ACTIVITY = [
-  "Extracting intent and document type",
-  "Checking required fields and missing details",
-  "Looking up official portals and practical guidance",
-  "Generating step-by-step workflow",
-  "Preparing checklist and draft documents",
-  "Preparing Urdu translation when available",
-] as const;
+type PhaseStatus = "pending" | "active" | "done";
+
+function phaseProgress(completedPhases: Set<StreamPhase>): number {
+  const weights: Record<StreamPhase, number> = {
+    extract: 15,
+    research: 35,
+    generate: 75,
+    translate: 90,
+    complete: 100,
+    error: 0,
+  };
+  let best = 0;
+  for (const p of completedPhases) {
+    if (weights[p] > best) best = weights[p];
+  }
+  return best;
+}
 
 export function AgentClient() {
   type AgentResult = z.infer<typeof AgentResponseSchema>;
   const [screen, setScreen] = React.useState<Screen>(1);
   const [query, setQuery] = React.useState("");
   const [busy, setBusy] = React.useState(false);
-  const [phaseIndex, setPhaseIndex] = React.useState(0);
-  const [progressValue, setProgressValue] = React.useState(0);
   const [elapsedSec, setElapsedSec] = React.useState(0);
   const [result, setResult] = React.useState<AgentResult | null>(null);
   const [clarification, setClarification] = React.useState<
@@ -84,28 +102,33 @@ export function AgentClient() {
     {},
   );
 
+  const [completedPhases, setCompletedPhases] = React.useState<
+    Set<StreamPhase>
+  >(new Set());
+  const [extractPreview, setExtractPreview] =
+    React.useState<ExtractPayload | null>(null);
+  const [researchPreview, setResearchPreview] =
+    React.useState<ResearchPayload | null>(null);
+  const [generatePreview, setGeneratePreview] =
+    React.useState<GeneratePayload | null>(null);
+
+  const progressValue = phaseProgress(completedPhases);
+
   React.useEffect(() => {
     if (!busy) {
-      setPhaseIndex(0);
-      setProgressValue(0);
       setElapsedSec(0);
       return;
     }
-    const phaseTimer = window.setInterval(() => {
-      setPhaseIndex((i) => (i + 1) % WORKFLOW_PHASES.length);
-    }, 4800);
-    const progressTimer = window.setInterval(() => {
-      setProgressValue((p) => (p >= 93 ? 93 : p + 0.4));
-    }, 220);
-    const elapsedTimer = window.setInterval(() => {
-      setElapsedSec((s) => s + 1);
-    }, 1000);
-    return () => {
-      window.clearInterval(phaseTimer);
-      window.clearInterval(progressTimer);
-      window.clearInterval(elapsedTimer);
-    };
+    const timer = window.setInterval(() => setElapsedSec((s) => s + 1), 1000);
+    return () => window.clearInterval(timer);
   }, [busy]);
+
+  function resetStreamState() {
+    setCompletedPhases(new Set());
+    setExtractPreview(null);
+    setResearchPreview(null);
+    setGeneratePreview(null);
+  }
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -122,12 +145,11 @@ export function AgentClient() {
         return;
       }
 
-      const qaBlock = clarification.questions
-        .map((q, i) => ({
-          index: i + 1,
-          question: q,
-          answer: clarificationAnswers[q].trim(),
-        }));
+      const qaBlock = clarification.questions.map((q, i) => ({
+        index: i + 1,
+        question: q,
+        answer: clarificationAnswers[q].trim(),
+      }));
       message = `${prompt}\n\nStructured details (treat these as confirmed user answers):\n${JSON.stringify(
         qaBlock,
         null,
@@ -136,26 +158,79 @@ export function AgentClient() {
     }
 
     setBusy(true);
+    resetStreamState();
+
     try {
       const res = await fetch("/api/agent", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ message }),
       });
-      const json = await res.json();
 
       if (!res.ok) {
+        const json = await res.json().catch(() => null);
         const errMsg =
           typeof json?.error === "string" ? json.error : "Request failed.";
         throw new Error(errMsg);
       }
 
-      const parsed = AgentResponseSchema.parse(json);
-      if (parsed.clarification.required) {
-        setClarification(parsed.clarification);
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error("No response stream.");
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalResult: AgentResult | null = null;
+      let streamError: string | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const events = parseSSE(buffer);
+
+        let consumed = 0;
+        for (const ev of events) {
+          const endIdx = buffer.indexOf("\n\n", consumed);
+          if (endIdx === -1) break;
+          consumed = endIdx + 2;
+
+          setCompletedPhases((prev) => new Set([...prev, ev.phase]));
+
+          switch (ev.phase) {
+            case "extract":
+              setExtractPreview(ev.data as ExtractPayload);
+              break;
+            case "research":
+              setResearchPreview(ev.data as ResearchPayload);
+              break;
+            case "generate":
+              setGeneratePreview(ev.data as GeneratePayload);
+              break;
+            case "complete":
+              finalResult = AgentResponseSchema.parse(ev.data);
+              break;
+            case "error":
+              streamError = (ev.data as { message: string }).message;
+              break;
+          }
+        }
+        buffer = buffer.slice(consumed);
+      }
+
+      if (streamError) {
+        throw new Error(streamError);
+      }
+
+      if (!finalResult) {
+        throw new Error("Stream ended without a complete result.");
+      }
+
+      if (finalResult.clarification.required) {
+        setClarification(finalResult.clarification);
         setClarificationAnswers((prev) =>
           Object.fromEntries(
-            parsed.clarification.questions.map((q) => [q, prev[q] ?? ""]),
+            finalResult!.clarification.questions.map((q) => [q, prev[q] ?? ""]),
           ),
         );
         setResult(null);
@@ -166,10 +241,10 @@ export function AgentClient() {
 
       setClarification(null);
       setClarificationAnswers({});
-      setResult(parsed);
+      setResult(finalResult);
       setCheckedDocs(
         Object.fromEntries(
-          parsed.navigator.requiredDocuments.map((d) => [d, false]),
+          finalResult.navigator.requiredDocuments.map((d) => [d, false]),
         ),
       );
       setScreen(2);
@@ -190,12 +265,44 @@ export function AgentClient() {
     }
   }
 
-  const phase = WORKFLOW_PHASES[phaseIndex];
   const hasUrdu = Boolean(result?.urdu);
-  const activityIndex = Math.min(
-    LIVE_ACTIVITY.length - 1,
-    Math.floor(elapsedSec / 7),
-  );
+
+  function getPhaseStatus(phaseKey: StreamPhase): PhaseStatus {
+    if (completedPhases.has(phaseKey)) return "done";
+    const order: StreamPhase[] = ["extract", "research", "generate", "translate"];
+    const idx = order.indexOf(phaseKey);
+    const prevPhases = order.slice(0, idx);
+    const allPrevDone = prevPhases.every((p) => completedPhases.has(p));
+    if (allPrevDone && !completedPhases.has(phaseKey)) return "active";
+    return "pending";
+  }
+
+  function phasePreviewText(phaseKey: StreamPhase): string | null {
+    if (!completedPhases.has(phaseKey)) return null;
+    switch (phaseKey) {
+      case "extract":
+        if (extractPreview) {
+          return `${extractPreview.processType} — ${extractPreview.intentSummary.slice(0, 80)}${extractPreview.intentSummary.length > 80 ? "…" : ""}`;
+        }
+        return null;
+      case "research":
+        if (researchPreview) {
+          const rc = researchPreview.webSearch.results.length;
+          const wc = researchPreview.validator.risksOrWarnings?.length ?? 0;
+          return `${rc} source${rc !== 1 ? "s" : ""} found${wc > 0 ? `, ${wc} warning${wc !== 1 ? "s" : ""}` : ""}`;
+        }
+        return null;
+      case "generate":
+        if (generatePreview) {
+          return `${generatePreview.stepsCount} steps, ${generatePreview.documentsCount} draft${generatePreview.documentsCount !== 1 ? "s" : ""}, ${generatePreview.requiredDocumentsCount} required doc${generatePreview.requiredDocumentsCount !== 1 ? "s" : ""}`;
+        }
+        return null;
+      case "translate":
+        return "Urdu translation ready";
+      default:
+        return null;
+    }
+  }
 
   return (
     <>
@@ -212,15 +319,15 @@ export function AgentClient() {
                 aria-hidden
               />
             </div>
-            <DialogTitle className="animate-in fade-in-0 zoom-in-95 text-center duration-300">
-              {phase.title}
+            <DialogTitle className="text-center">
+              Processing your request
             </DialogTitle>
             <DialogDescription className="text-center">
-              {phase.detail}
+              Each agent step streams results as it completes.
             </DialogDescription>
             <p className="text-center text-xs text-muted-foreground tabular-nums">
               {elapsedSec > 0
-                ? `${elapsedSec}s elapsed — this can take a few minutes`
+                ? `${elapsedSec}s elapsed`
                 : "Starting…"}
             </p>
           </DialogHeader>
@@ -228,46 +335,48 @@ export function AgentClient() {
             <Progress value={progressValue} className="w-full" />
             <div className="flex justify-between text-xs text-muted-foreground">
               <span>
-                Step {phaseIndex + 1} of {WORKFLOW_PHASES.length}
+                {completedPhases.size} of {WORKFLOW_PHASES.length} phases done
               </span>
               <span className="tabular-nums">{Math.round(progressValue)}%</span>
             </div>
           </div>
           <Card size="sm" className="bg-background/70">
             <CardHeader>
-              <CardTitle className="text-sm">What is happening now</CardTitle>
+              <CardTitle className="text-sm">Agent pipeline</CardTitle>
               <CardDescription>
-                Live behind-the-scenes pipeline while your response is being built.
+                Live progress from each agent step.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="space-y-2">
-                {WORKFLOW_PHASES.map((step, idx) => {
-                  const state =
-                    idx < phaseIndex
-                      ? "done"
-                      : idx === phaseIndex
-                        ? "active"
-                        : "pending";
+                {WORKFLOW_PHASES.map((step) => {
+                  const status = getPhaseStatus(step.key);
+                  const preview = phasePreviewText(step.key);
                   return (
                     <div
                       key={step.key}
                       className="flex items-start gap-2 rounded-md border bg-background/70 px-3 py-2"
                     >
                       <div className="mt-0.5">
-                        {state === "done" ? (
+                        {status === "done" ? (
                           <CheckCircle2 className="size-4 text-emerald-600" />
-                        ) : state === "active" ? (
+                        ) : status === "active" ? (
                           <Loader2 className="size-4 animate-spin text-primary" />
                         ) : (
                           <Clock3 className="size-4 text-muted-foreground" />
                         )}
                       </div>
-                      <div className="min-w-0">
+                      <div className="min-w-0 flex-1">
                         <p className="text-xs font-medium">{step.title}</p>
-                        <p className="text-xs text-muted-foreground">
-                          {step.detail}
-                        </p>
+                        {status === "done" && preview ? (
+                          <p className="text-xs text-emerald-700 dark:text-emerald-400">
+                            {preview}
+                          </p>
+                        ) : (
+                          <p className="text-xs text-muted-foreground">
+                            {step.detail}
+                          </p>
+                        )}
                       </div>
                     </div>
                   );
@@ -278,8 +387,16 @@ export function AgentClient() {
                   <Sparkles className="size-3" /> Live activity
                 </p>
                 <p className="text-xs">
-                  {LIVE_ACTIVITY[activityIndex]}
-                  {busy ? (
+                  {completedPhases.has("complete")
+                    ? "All phases complete — loading results"
+                    : completedPhases.has("generate")
+                      ? "Finishing up"
+                      : completedPhases.has("research")
+                        ? "Building guide and drafts"
+                        : completedPhases.has("extract")
+                          ? "Researching portals and validating"
+                          : "Analyzing your request"}
+                  {busy && !completedPhases.has("complete") ? (
                     <span className="inline-flex">
                       <span className="animate-pulse">.</span>
                       <span

@@ -1,4 +1,5 @@
-import { z } from "zod";
+import { z, type ZodType } from "zod";
+import type { BaseMessageLike } from "@langchain/core/messages";
 import { getLLM } from "@/lib/agent/llm";
 import { runWebResearch } from "@/lib/agent/web-search";
 import { parseTimeoutMs, withTimeout } from "@/lib/agent/timeouts";
@@ -12,16 +13,55 @@ import {
   ValidatorOutputSchema,
   WebSearchOutputSchema,
 } from "@/lib/agent/schemas";
+import type { OnPhase } from "@/lib/agent/stream-events";
 
 const UserInputSchema = z.object({
   message: z.string().min(1),
 });
 
-export type RunAgentWorkflowInput = z.infer<typeof UserInputSchema>;
+const MAX_PARSE_RETRIES = 2;
+
+/**
+ * Invoke an LLM with structured output, retrying on empty/unparseable
+ * responses. LangChain's built-in maxRetries only covers HTTP errors;
+ * this handles OutputParserException from empty model replies.
+ */
+async function structuredInvoke<T>(
+  llm: ReturnType<typeof getLLM>,
+  schema: ZodType<T>,
+  messages: BaseMessageLike[],
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= MAX_PARSE_RETRIES; attempt++) {
+    try {
+      const raw = await withTimeout(
+        llm.withStructuredOutput(schema).invoke(messages),
+        timeoutMs,
+        label,
+      );
+      return schema.parse(raw);
+    } catch (err) {
+      lastError = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const isParseFailure =
+        /failed to parse|unexpected end of json|output_parsing_failure/i.test(msg);
+      if (!isParseFailure || attempt === MAX_PARSE_RETRIES) break;
+    }
+  }
+  throw lastError;
+}
+
+export type RunAgentWorkflowInput = z.infer<typeof UserInputSchema> & {
+  onPhase?: OnPhase;
+};
 
 type HelpfulLink = { name: string; url: string; note?: string };
-const VERCEL_HOBBY_MAX_RUNTIME_MS = 300_000;
-const VERCEL_TIMEOUT_SAFETY_BUFFER_MS = 15_000;
+const SERVERLESS_MAX_RUNTIME_MS = 300_000;
+const SERVERLESS_TIMEOUT_SAFETY_BUFFER_MS = 30_000;
+const DEFAULT_WORKFLOW_BUDGET_MS =
+  SERVERLESS_MAX_RUNTIME_MS - SERVERLESS_TIMEOUT_SAFETY_BUFFER_MS;
 
 function buildHelpfulLinks(input: {
   kb: { officialPortals: Array<{ name: string; url?: string; note?: string }> } | null;
@@ -204,32 +244,35 @@ function buildClarification(input: {
 }
 
 export async function runAgentWorkflow(input: RunAgentWorkflowInput) {
-  // Three structured LLM calls + web search; self-hosted models often need >5m.
-  // On Vercel, clamp below the platform limit so we can return a controlled 504
-  // rather than a hard runtime kill.
   const configuredCapMs = parseTimeoutMs(
     process.env.AGENT_WORKFLOW_TIMEOUT_MS,
     900_000,
     1_800_000,
   );
-  const runningOnVercel = process.env.VERCEL === "1";
-  const capMs = runningOnVercel
-    ? Math.min(
-        configuredCapMs,
-        VERCEL_HOBBY_MAX_RUNTIME_MS - VERCEL_TIMEOUT_SAFETY_BUFFER_MS,
-      )
-    : configuredCapMs;
+  const runtimeBudgetMs = parseTimeoutMs(
+    process.env.AGENT_RUNTIME_BUDGET_MS,
+    DEFAULT_WORKFLOW_BUDGET_MS,
+    SERVERLESS_MAX_RUNTIME_MS,
+  );
+  const capMs = Math.min(configuredCapMs, runtimeBudgetMs);
   return withTimeout(runAgentWorkflowInner(input), capMs, "Agent workflow");
 }
 
 async function runAgentWorkflowInner(input: RunAgentWorkflowInput) {
-  const { message } = UserInputSchema.parse(input);
+  const { message, onPhase } = input;
+  UserInputSchema.parse({ message });
   const llm = getLLM();
   const fastMode = process.env.AGENT_FAST_MODE !== "0";
+  const llmStepTimeoutMs = parseTimeoutMs(
+    process.env.AGENT_LLM_STEP_TIMEOUT_MS,
+    75_000,
+    240_000,
+  );
 
-  const extractor = await llm
-    .withStructuredOutput(ExtractorOutputSchema)
-    .invoke([
+  const extractor = await structuredInvoke(
+    llm,
+    ExtractorOutputSchema,
+    [
       [
         "system",
         [
@@ -240,7 +283,15 @@ async function runAgentWorkflowInner(input: RunAgentWorkflowInput) {
         ].join("\n"),
       ],
       ["human", message],
-    ]);
+    ],
+    llmStepTimeoutMs,
+    "Extractor step",
+  );
+
+  onPhase?.("extract", {
+    ...extractor,
+    questionsToAsk: extractor.questionsToAsk ?? [],
+  });
 
   const kb = getKbForProcessType(extractor.processType);
 
@@ -265,26 +316,41 @@ async function runAgentWorkflowInner(input: RunAgentWorkflowInput) {
             "Which city/province is this for, and what documents do you already have (CNIC/B-Form, photos, proof of address)?",
         }),
       )
-    : llm.withStructuredOutput(ValidatorOutputSchema).invoke([
+    : structuredInvoke(
+        llm,
+        ValidatorOutputSchema,
         [
-          "system",
           [
-            "You are the Validation Agent.",
-            "Given the extractor output and the user's original message, identify missing fields and risks/warnings.",
-            "Return a single best next question to ask the user.",
-            "Do not invent user data.",
-          ].join("\n"),
+            "system",
+            [
+              "You are the Validation Agent.",
+              "Given the extractor output and the user's original message, identify missing fields and risks/warnings.",
+              "Return a single best next question to ask the user.",
+              "Do not invent user data.",
+            ].join("\n"),
+          ],
+          [
+            "human",
+            JSON.stringify({ userMessage: message, extractor, kb }, null, 2),
+          ],
         ],
-        [
-          "human",
-          JSON.stringify({ userMessage: message, extractor, kb }, null, 2),
-        ],
-      ]);
+        llmStepTimeoutMs,
+        "Validator step",
+      );
 
   const [webSearch, validator] = await Promise.all([
     webSearchPromise,
     validatorPromise,
   ]);
+  onPhase?.("research", {
+    webSearch,
+    validator: {
+      ...validator,
+      missingFields: validator.missingFields ?? [],
+      risksOrWarnings: validator.risksOrWarnings ?? [],
+    },
+  });
+
   const clarification = buildClarification({
     userMessage: message,
     extractor,
@@ -293,9 +359,10 @@ async function runAgentWorkflowInner(input: RunAgentWorkflowInput) {
 
   const helpfulLinks = buildHelpfulLinks({ kb, webSearch });
 
-  const navAndDocs = await llm
-    .withStructuredOutput(NavigatorAndDocumentsOutputSchema)
-    .invoke([
+  const navAndDocs = await structuredInvoke(
+    llm,
+    NavigatorAndDocumentsOutputSchema,
+    [
       [
         "system",
         [
@@ -329,7 +396,16 @@ async function runAgentWorkflowInner(input: RunAgentWorkflowInput) {
           2,
         ),
       ],
-    ]);
+    ],
+    llmStepTimeoutMs,
+    "Navigator/document step",
+  );
+
+  onPhase?.("generate", {
+    stepsCount: navAndDocs.steps.length,
+    documentsCount: navAndDocs.documents.length,
+    requiredDocumentsCount: navAndDocs.requiredDocuments.length,
+  });
 
   const baseResponse = {
     extractor,
@@ -349,42 +425,51 @@ async function runAgentWorkflowInner(input: RunAgentWorkflowInput) {
     (!fastMode && process.env.AGENT_ENABLE_URDU !== "0");
   if (shouldTranslateUrdu) {
     try {
-      const translated = await llm.withStructuredOutput(UrduTranslationOutputSchema).invoke([
+      const translated = await structuredInvoke(
+        llm,
+        UrduTranslationOutputSchema,
         [
-          "system",
           [
-            "Translate bureaucracy guidance from English to Urdu (Pakistan).",
-            "Keep the same meaning, list order, and markdown structure.",
-            "Preserve all URLs exactly as-is and keep placeholders like {{name}} unchanged.",
-            "Use natural Urdu in Urdu script, concise and clear.",
-            "Output only translated fields in the requested schema.",
-          ].join("\n"),
+            "system",
+            [
+              "Translate bureaucracy guidance from English to Urdu (Pakistan).",
+              "Keep the same meaning, list order, and markdown structure.",
+              "Preserve all URLs exactly as-is and keep placeholders like {{name}} unchanged.",
+              "Use natural Urdu in Urdu script, concise and clear.",
+              "Output only translated fields in the requested schema.",
+            ].join("\n"),
+          ],
+          [
+            "human",
+            JSON.stringify(
+              {
+                intentSummary: baseResponse.extractor.intentSummary,
+                steps: baseResponse.navigator.steps,
+                requiredDocuments: baseResponse.navigator.requiredDocuments,
+                feesAndTimelines: baseResponse.navigator.feesAndTimelines,
+                documents: baseResponse.documentGenerator.documents,
+              },
+              null,
+              2,
+            ),
+          ],
         ],
-        [
-          "human",
-          JSON.stringify(
-            {
-              intentSummary: baseResponse.extractor.intentSummary,
-              steps: baseResponse.navigator.steps,
-              requiredDocuments: baseResponse.navigator.requiredDocuments,
-              feesAndTimelines: baseResponse.navigator.feesAndTimelines,
-              documents: baseResponse.documentGenerator.documents,
-            },
-            null,
-            2,
-          ),
-        ],
-      ]);
+        llmStepTimeoutMs,
+        "Urdu translation step",
+      );
       urdu = UrduTranslationOutputSchema.parse(translated);
     } catch {
       urdu = undefined;
     }
   }
+  onPhase?.("translate", { available: Boolean(urdu) });
 
-  return AgentResponseSchema.parse({
+  const finalResult = AgentResponseSchema.parse({
     ...baseResponse,
     urdu,
     clarification,
   });
+  onPhase?.("complete", finalResult);
+  return finalResult;
 }
 

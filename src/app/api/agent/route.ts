@@ -1,9 +1,8 @@
-import { NextResponse } from "next/server";
 import { z } from "zod";
 import { runAgentWorkflow } from "@/lib/agent/workflow";
+import { encodeSSE, type StreamPhase } from "@/lib/agent/stream-events";
 
 export const runtime = "nodejs";
-/** Serverless ceiling; align with `AGENT_WORKFLOW_TIMEOUT_MS` on your host. */
 export const maxDuration = 300;
 
 const RequestSchema = z.object({
@@ -11,21 +10,47 @@ const RequestSchema = z.object({
 });
 
 export async function POST(req: Request) {
+  let parsed: z.infer<typeof RequestSchema>;
   try {
-    const json = await req.json();
-    const { message } = RequestSchema.parse(json);
-
-    const result = await runAgentWorkflow({ message });
-    return NextResponse.json(result);
-  } catch (err) {
-    const errMessage =
-      err instanceof Error ? err.message : "Unknown error while running agent.";
-    const timedOut =
-      /timed out|timeout/i.test(errMessage) ||
-      (err instanceof Error && err.name === "AbortError");
-    return NextResponse.json(
-      { error: errMessage },
-      { status: timedOut ? 504 : 400 },
-    );
+    parsed = RequestSchema.parse(await req.json());
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid request body." }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
   }
+
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = <P extends StreamPhase>(phase: P, data: unknown) => {
+        try {
+          controller.enqueue(encoder.encode(encodeSSE(phase, data)));
+        } catch {
+          /* stream already closed */
+        }
+      };
+
+      try {
+        await runAgentWorkflow({
+          message: parsed.message,
+          onPhase: send,
+        });
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Unknown error while running agent.";
+        send("error", { message });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+    },
+  });
 }
