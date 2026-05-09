@@ -20,6 +20,8 @@ const UserInputSchema = z.object({
 export type RunAgentWorkflowInput = z.infer<typeof UserInputSchema>;
 
 type HelpfulLink = { name: string; url: string; note?: string };
+const VERCEL_HOBBY_MAX_RUNTIME_MS = 300_000;
+const VERCEL_TIMEOUT_SAFETY_BUFFER_MS = 15_000;
 
 function buildHelpfulLinks(input: {
   kb: { officialPortals: Array<{ name: string; url?: string; note?: string }> } | null;
@@ -203,11 +205,20 @@ function buildClarification(input: {
 
 export async function runAgentWorkflow(input: RunAgentWorkflowInput) {
   // Three structured LLM calls + web search; self-hosted models often need >5m.
-  const capMs = parseTimeoutMs(
+  // On Vercel, clamp below the platform limit so we can return a controlled 504
+  // rather than a hard runtime kill.
+  const configuredCapMs = parseTimeoutMs(
     process.env.AGENT_WORKFLOW_TIMEOUT_MS,
     900_000,
     1_800_000,
   );
+  const runningOnVercel = process.env.VERCEL === "1";
+  const capMs = runningOnVercel
+    ? Math.min(
+        configuredCapMs,
+        VERCEL_HOBBY_MAX_RUNTIME_MS - VERCEL_TIMEOUT_SAFETY_BUFFER_MS,
+      )
+    : configuredCapMs;
   return withTimeout(runAgentWorkflowInner(input), capMs, "Agent workflow");
 }
 
@@ -333,36 +344,41 @@ async function runAgentWorkflowInner(input: RunAgentWorkflowInput) {
   };
 
   let urdu: z.infer<typeof UrduTranslationOutputSchema> | undefined;
-  try {
-    const translated = await llm.withStructuredOutput(UrduTranslationOutputSchema).invoke([
-      [
-        "system",
+  const shouldTranslateUrdu =
+    process.env.AGENT_ENABLE_URDU === "1" ||
+    (!fastMode && process.env.AGENT_ENABLE_URDU !== "0");
+  if (shouldTranslateUrdu) {
+    try {
+      const translated = await llm.withStructuredOutput(UrduTranslationOutputSchema).invoke([
         [
-          "Translate bureaucracy guidance from English to Urdu (Pakistan).",
-          "Keep the same meaning, list order, and markdown structure.",
-          "Preserve all URLs exactly as-is and keep placeholders like {{name}} unchanged.",
-          "Use natural Urdu in Urdu script, concise and clear.",
-          "Output only translated fields in the requested schema.",
-        ].join("\n"),
-      ],
-      [
-        "human",
-        JSON.stringify(
-          {
-            intentSummary: baseResponse.extractor.intentSummary,
-            steps: baseResponse.navigator.steps,
-            requiredDocuments: baseResponse.navigator.requiredDocuments,
-            feesAndTimelines: baseResponse.navigator.feesAndTimelines,
-            documents: baseResponse.documentGenerator.documents,
-          },
-          null,
-          2,
-        ),
-      ],
-    ]);
-    urdu = UrduTranslationOutputSchema.parse(translated);
-  } catch {
-    urdu = undefined;
+          "system",
+          [
+            "Translate bureaucracy guidance from English to Urdu (Pakistan).",
+            "Keep the same meaning, list order, and markdown structure.",
+            "Preserve all URLs exactly as-is and keep placeholders like {{name}} unchanged.",
+            "Use natural Urdu in Urdu script, concise and clear.",
+            "Output only translated fields in the requested schema.",
+          ].join("\n"),
+        ],
+        [
+          "human",
+          JSON.stringify(
+            {
+              intentSummary: baseResponse.extractor.intentSummary,
+              steps: baseResponse.navigator.steps,
+              requiredDocuments: baseResponse.navigator.requiredDocuments,
+              feesAndTimelines: baseResponse.navigator.feesAndTimelines,
+              documents: baseResponse.documentGenerator.documents,
+            },
+            null,
+            2,
+          ),
+        ],
+      ]);
+      urdu = UrduTranslationOutputSchema.parse(translated);
+    } catch {
+      urdu = undefined;
+    }
   }
 
   return AgentResponseSchema.parse({
