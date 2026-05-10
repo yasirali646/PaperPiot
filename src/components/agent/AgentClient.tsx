@@ -438,7 +438,7 @@ export function AgentClient() {
                   id="apply-for"
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
-                  placeholder="e.g. domicile certificate in Punjab"
+                  placeholder="e.g. domicile certificate in Sindh"
                   disabled={busy}
                   autoComplete="off"
                   className="transition-all duration-200 focus-visible:ring-2"
