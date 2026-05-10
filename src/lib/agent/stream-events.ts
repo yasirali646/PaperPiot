@@ -1,38 +1,31 @@
 import type { z } from "zod";
 import type {
   AgentResponseSchema,
-  ExtractorOutputSchema,
-  ValidatorOutputSchema,
-  WebSearchOutputSchema,
+  ClarificationOutputSchema,
+  ProcessTypeSchema,
 } from "@/lib/agent/schemas";
 
 export type StreamPhase =
   | "extract"
-  | "research"
   | "generate"
-  | "translate"
   | "complete"
   | "error";
 
-export type ExtractPayload = z.infer<typeof ExtractorOutputSchema>;
-export type ResearchPayload = {
-  webSearch: z.infer<typeof WebSearchOutputSchema>;
-  validator: z.infer<typeof ValidatorOutputSchema>;
+export type ExtractPayload = {
+  processType: z.infer<typeof ProcessTypeSchema>;
+  clarification: z.infer<typeof ClarificationOutputSchema>;
 };
 export type GeneratePayload = {
   stepsCount: number;
   documentsCount: number;
   requiredDocumentsCount: number;
 };
-export type TranslatePayload = { available: boolean };
 export type CompletePayload = z.infer<typeof AgentResponseSchema>;
 export type ErrorPayload = { message: string };
 
 export type StreamEventMap = {
   extract: ExtractPayload;
-  research: ResearchPayload;
   generate: GeneratePayload;
-  translate: TranslatePayload;
   complete: CompletePayload;
   error: ErrorPayload;
 };

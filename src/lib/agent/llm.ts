@@ -18,7 +18,7 @@ export function getLLM() {
 
   const timeout = parseTimeoutMs(
     process.env.LLM_TIMEOUT_MS ?? process.env.OPENAI_TIMEOUT_MS,
-    90_000,
+    180_000,
   );
   let maxRetries = 1;
   if (

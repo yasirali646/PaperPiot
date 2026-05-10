@@ -58,12 +58,12 @@ export function buildDraftPdf(result: AgentResponse): void {
   };
 
   writeBlock(
-    `${result.extractor.processType.replace(/^\w/, (c) => c.toUpperCase())} - draft pack`,
+    `${result.processType.replace(/^\w/, (c) => c.toUpperCase())} - draft pack`,
     15,
     "bold",
     3,
   );
-  writeBlock(result.extractor.intentSummary, 10, "normal", 6);
+  writeBlock(result.intentSummary, 10, "normal", 6);
 
   writeBlock("Steps", 12, "bold", 2);
   result.navigator.steps.forEach((step, i) => {
@@ -98,5 +98,5 @@ export function buildDraftPdf(result: AgentResponse): void {
     );
   });
 
-  doc.save(`bureaucracy-draft-${result.extractor.processType}.pdf`);
+  doc.save(`bureaucracy-draft-${result.processType}.pdf`);
 }

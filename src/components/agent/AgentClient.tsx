@@ -10,7 +10,6 @@ import {
   parseSSE,
   type StreamPhase,
   type ExtractPayload,
-  type ResearchPayload,
   type GeneratePayload,
 } from "@/lib/agent/stream-events";
 import { buildDraftPdf } from "@/lib/build-draft-pdf";
@@ -48,22 +47,12 @@ const WORKFLOW_PHASES: {
   {
     key: "extract",
     title: "Understanding your request",
-    detail: "Working out what you're applying for and what to ask next.",
-  },
-  {
-    key: "research",
-    title: "Gathering live context",
-    detail: "Searching for Pakistan portals, forms, and practical guidance.",
+    detail: "Detecting process type and checking for missing info.",
   },
   {
     key: "generate",
     title: "Building your guide & drafts",
     detail: "Writing steps, document checklist, and copy-ready draft text.",
-  },
-  {
-    key: "translate",
-    title: "Translating to Urdu",
-    detail: "Preparing an Urdu version of the guidance.",
   },
 ];
 
@@ -72,9 +61,7 @@ type PhaseStatus = "pending" | "active" | "done";
 function phaseProgress(completedPhases: Set<StreamPhase>): number {
   const weights: Record<StreamPhase, number> = {
     extract: 15,
-    research: 35,
-    generate: 75,
-    translate: 90,
+    generate: 85,
     complete: 100,
     error: 0,
   };
@@ -107,8 +94,6 @@ export function AgentClient() {
   >(new Set());
   const [extractPreview, setExtractPreview] =
     React.useState<ExtractPayload | null>(null);
-  const [researchPreview, setResearchPreview] =
-    React.useState<ResearchPayload | null>(null);
   const [generatePreview, setGeneratePreview] =
     React.useState<GeneratePayload | null>(null);
 
@@ -126,7 +111,6 @@ export function AgentClient() {
   function resetStreamState() {
     setCompletedPhases(new Set());
     setExtractPreview(null);
-    setResearchPreview(null);
     setGeneratePreview(null);
   }
 
@@ -201,9 +185,6 @@ export function AgentClient() {
             case "extract":
               setExtractPreview(ev.data as ExtractPayload);
               break;
-            case "research":
-              setResearchPreview(ev.data as ResearchPayload);
-              break;
             case "generate":
               setGeneratePreview(ev.data as GeneratePayload);
               break;
@@ -265,11 +246,9 @@ export function AgentClient() {
     }
   }
 
-  const hasUrdu = Boolean(result?.urdu);
-
   function getPhaseStatus(phaseKey: StreamPhase): PhaseStatus {
     if (completedPhases.has(phaseKey)) return "done";
-    const order: StreamPhase[] = ["extract", "research", "generate", "translate"];
+    const order: StreamPhase[] = ["extract", "generate"];
     const idx = order.indexOf(phaseKey);
     const prevPhases = order.slice(0, idx);
     const allPrevDone = prevPhases.every((p) => completedPhases.has(p));
@@ -282,14 +261,7 @@ export function AgentClient() {
     switch (phaseKey) {
       case "extract":
         if (extractPreview) {
-          return `${extractPreview.processType} — ${extractPreview.intentSummary.slice(0, 80)}${extractPreview.intentSummary.length > 80 ? "…" : ""}`;
-        }
-        return null;
-      case "research":
-        if (researchPreview) {
-          const rc = researchPreview.webSearch.results.length;
-          const wc = researchPreview.validator.risksOrWarnings?.length ?? 0;
-          return `${rc} source${rc !== 1 ? "s" : ""} found${wc > 0 ? `, ${wc} warning${wc !== 1 ? "s" : ""}` : ""}`;
+          return `Detected: ${extractPreview.processType}`;
         }
         return null;
       case "generate":
@@ -297,8 +269,6 @@ export function AgentClient() {
           return `${generatePreview.stepsCount} steps, ${generatePreview.documentsCount} draft${generatePreview.documentsCount !== 1 ? "s" : ""}, ${generatePreview.requiredDocumentsCount} required doc${generatePreview.requiredDocumentsCount !== 1 ? "s" : ""}`;
         }
         return null;
-      case "translate":
-        return "Urdu translation ready";
       default:
         return null;
     }
@@ -323,7 +293,7 @@ export function AgentClient() {
               Processing your request
             </DialogTitle>
             <DialogDescription className="text-center">
-              Each agent step streams results as it completes.
+              Generating your step-by-step guide and drafts.
             </DialogDescription>
             <p className="text-center text-xs text-muted-foreground tabular-nums">
               {elapsedSec > 0
@@ -335,16 +305,16 @@ export function AgentClient() {
             <Progress value={progressValue} className="w-full" />
             <div className="flex justify-between text-xs text-muted-foreground">
               <span>
-                {completedPhases.size} of {WORKFLOW_PHASES.length} phases done
+                {completedPhases.size} of {WORKFLOW_PHASES.length} steps done
               </span>
               <span className="tabular-nums">{Math.round(progressValue)}%</span>
             </div>
           </div>
           <Card size="sm" className="bg-background/70">
             <CardHeader>
-              <CardTitle className="text-sm">Agent pipeline</CardTitle>
+              <CardTitle className="text-sm">Progress</CardTitle>
               <CardDescription>
-                Live progress from each agent step.
+                Live status from PaperPilot.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -388,14 +358,10 @@ export function AgentClient() {
                 </p>
                 <p className="text-xs">
                   {completedPhases.has("complete")
-                    ? "All phases complete — loading results"
-                    : completedPhases.has("generate")
-                      ? "Finishing up"
-                      : completedPhases.has("research")
-                        ? "Building guide and drafts"
-                        : completedPhases.has("extract")
-                          ? "Researching portals and validating"
-                          : "Analyzing your request"}
+                    ? "Done — loading results"
+                    : completedPhases.has("extract")
+                      ? "Building guide and drafts"
+                      : "Analyzing your request"}
                   {busy && !completedPhases.has("complete") ? (
                     <span className="inline-flex">
                       <span className="animate-pulse">.</span>
@@ -429,7 +395,7 @@ export function AgentClient() {
           </CardTitle>
           {result ? (
             <Badge variant="secondary" className="capitalize">
-              {result.extractor.processType}
+              {result.processType}
             </Badge>
           ) : null}
         </CardHeader>
@@ -530,34 +496,9 @@ export function AgentClient() {
           {screen === 2 && result && (
             <div className="animate-in fade-in-0 slide-in-from-right-2 space-y-6 duration-300">
               <div>
-                {hasUrdu ? (
-                  <div className="mb-4 grid gap-3 md:grid-cols-2">
-                    <Card size="sm" className="bg-background/70">
-                      <CardHeader>
-                        <CardTitle className="text-sm">English</CardTitle>
-                      </CardHeader>
-                      <CardContent>
-                        <AgentMarkdown className="[&_p]:mb-0">
-                          {result.extractor.intentSummary}
-                        </AgentMarkdown>
-                      </CardContent>
-                    </Card>
-                    <Card size="sm" className="bg-background/70" dir="rtl">
-                      <CardHeader>
-                        <CardTitle className="text-sm">اردو</CardTitle>
-                      </CardHeader>
-                      <CardContent>
-                        <AgentMarkdown className="[&_p]:mb-0 text-right">
-                          {result.urdu?.intentSummary ?? ""}
-                        </AgentMarkdown>
-                      </CardContent>
-                    </Card>
-                  </div>
-                ) : (
-                  <AgentMarkdown className="mb-4">
-                    {result.extractor.intentSummary}
-                  </AgentMarkdown>
-                )}
+                <AgentMarkdown className="mb-4">
+                  {result.intentSummary}
+                </AgentMarkdown>
                 <p className="mb-2 text-sm font-medium">Steps</p>
                 <ScrollArea className="h-[min(44vh,420px)] rounded-xl border bg-background/60 p-3">
                   <ol className="space-y-3">
@@ -571,64 +512,20 @@ export function AgentClient() {
                             {i + 1}
                           </div>
                           <div className="min-w-0 flex-1 space-y-2">
-                            {hasUrdu ? (
-                              <div className="grid gap-3 md:grid-cols-2">
-                                <div className="space-y-2">
-                                  <p className="text-xs font-medium text-muted-foreground">
-                                    English
-                                  </p>
-                                  <AgentMarkdown className="[&_p]:mb-0 [&_p]:text-foreground [&_strong]:text-foreground">
-                                    {s.title}
-                                  </AgentMarkdown>
-                                  {s.details.trim() ? (
-                                    <AgentMarkdown className="[&_p]:mb-0">
-                                      {s.details}
-                                    </AgentMarkdown>
-                                  ) : null}
-                                  {s.officeOrPortal &&
-                                  s.officeOrPortal !== "N/A" ? (
-                                    <p className="text-xs text-muted-foreground">
-                                      {s.officeOrPortal}
-                                    </p>
-                                  ) : null}
-                                </div>
-                                <div className="space-y-2 text-right" dir="rtl">
-                                  <p className="text-xs font-medium text-muted-foreground">
-                                    اردو
-                                  </p>
-                                  <AgentMarkdown className="[&_p]:mb-0 [&_p]:text-foreground [&_strong]:text-foreground">
-                                    {result.urdu?.steps[i]?.title ?? ""}
-                                  </AgentMarkdown>
-                                  <AgentMarkdown className="[&_p]:mb-0">
-                                    {result.urdu?.steps[i]?.details ?? ""}
-                                  </AgentMarkdown>
-                                  {result.urdu?.steps[i]?.officeOrPortal &&
-                                  result.urdu.steps[i]?.officeOrPortal !==
-                                    "N/A" ? (
-                                    <p className="text-xs text-muted-foreground">
-                                      {result.urdu.steps[i]?.officeOrPortal}
-                                    </p>
-                                  ) : null}
-                                </div>
-                              </div>
-                            ) : (
-                              <>
-                                <AgentMarkdown className="[&_p]:mb-0 [&_p]:text-foreground [&_strong]:text-foreground">
-                                  {s.title}
-                                </AgentMarkdown>
-                                {s.details.trim() ? (
-                                  <AgentMarkdown className="[&_p]:mb-0">
-                                    {s.details}
-                                  </AgentMarkdown>
-                                ) : null}
-                                {s.officeOrPortal &&
-                                s.officeOrPortal !== "N/A" ? (
-                                  <p className="text-xs text-muted-foreground">
-                                    {s.officeOrPortal}
-                                  </p>
-                                ) : null}
-                              </>
-                            )}
+                            <AgentMarkdown className="[&_p]:mb-0 [&_p]:text-foreground [&_strong]:text-foreground">
+                              {s.title}
+                            </AgentMarkdown>
+                            {s.details.trim() ? (
+                              <AgentMarkdown className="[&_p]:mb-0">
+                                {s.details}
+                              </AgentMarkdown>
+                            ) : null}
+                            {s.officeOrPortal &&
+                            s.officeOrPortal !== "N/A" ? (
+                              <p className="text-xs text-muted-foreground">
+                                {s.officeOrPortal}
+                              </p>
+                            ) : null}
                           </div>
                         </div>
                       </li>
@@ -650,22 +547,9 @@ export function AgentClient() {
                             key={i}
                             className="rounded-lg border bg-background/80 p-3"
                           >
-                            {hasUrdu ? (
-                              <div className="grid gap-3 md:grid-cols-2">
-                                <AgentMarkdown className="[&_p]:mb-0 [&_p]:leading-7">
-                                  {t}
-                                </AgentMarkdown>
-                                <div dir="rtl">
-                                  <AgentMarkdown className="[&_p]:mb-0 [&_p]:leading-7 text-right">
-                                    {result.urdu?.feesAndTimelines[i] ?? ""}
-                                  </AgentMarkdown>
-                                </div>
-                              </div>
-                            ) : (
-                              <AgentMarkdown className="[&_p]:mb-0 [&_p]:leading-7">
-                                {t}
-                              </AgentMarkdown>
-                            )}
+                            <AgentMarkdown className="[&_p]:mb-0 [&_p]:leading-7">
+                              {t}
+                            </AgentMarkdown>
                           </div>
                         ))}
                       </CardContent>
@@ -679,7 +563,7 @@ export function AgentClient() {
                 <Card size="sm" className="bg-background/65">
                   <CardContent className="pt-6">
                     <ul className="space-y-3">
-                      {result.navigator.requiredDocuments.map((name, i) => (
+                      {result.navigator.requiredDocuments.map((name) => (
                         <li key={name} className="flex items-start gap-3">
                           <Checkbox
                             id={`doc-${encodeURIComponent(name)}`}
@@ -696,22 +580,9 @@ export function AgentClient() {
                             htmlFor={`doc-${encodeURIComponent(name)}`}
                             className="cursor-pointer font-normal leading-snug"
                           >
-                            {hasUrdu ? (
-                              <div className="grid gap-2 md:grid-cols-2">
-                                <AgentMarkdown className="[&_p]:mb-0 [&_p]:inline">
-                                  {name}
-                                </AgentMarkdown>
-                                <div dir="rtl">
-                                  <AgentMarkdown className="[&_p]:mb-0 [&_p]:inline text-right">
-                                    {result.urdu?.requiredDocuments[i] ?? ""}
-                                  </AgentMarkdown>
-                                </div>
-                              </div>
-                            ) : (
-                              <AgentMarkdown className="[&_p]:mb-0 [&_p]:inline">
-                                {name}
-                              </AgentMarkdown>
-                            )}
+                            <AgentMarkdown className="[&_p]:mb-0 [&_p]:inline">
+                              {name}
+                            </AgentMarkdown>
                           </Label>
                         </li>
                       ))}
@@ -747,33 +618,11 @@ export function AgentClient() {
                 <div className="space-y-6">
                   {result.documentGenerator.documents.map((d, i) => (
                     <div key={i}>
-                      {hasUrdu ? (
-                        <div className="grid gap-3 md:grid-cols-2">
-                          <div>
-                            <p className="font-medium">{d.name}</p>
-                            <AgentMarkdown className="mt-2">
-                              {d.content?.trim() ||
-                                "No draft text was returned for this section."}
-                            </AgentMarkdown>
-                          </div>
-                          <div dir="rtl" className="text-right">
-                            <p className="font-medium">
-                              {result.urdu?.documents[i]?.name ?? "اردو"}
-                            </p>
-                            <AgentMarkdown className="mt-2 text-right">
-                              {result.urdu?.documents[i]?.content?.trim() ?? ""}
-                            </AgentMarkdown>
-                          </div>
-                        </div>
-                      ) : (
-                        <>
-                          <p className="font-medium">{d.name}</p>
-                          <AgentMarkdown className="mt-2">
-                            {d.content?.trim() ||
-                              "No draft text was returned for this section."}
-                          </AgentMarkdown>
-                        </>
-                      )}
+                      <p className="font-medium">{d.name}</p>
+                      <AgentMarkdown className="mt-2">
+                        {d.content?.trim() ||
+                          "No draft text was returned for this section."}
+                      </AgentMarkdown>
                       {i < result.documentGenerator.documents.length - 1 ? (
                         <Separator className="mt-6" />
                       ) : null}
